@@ -1,0 +1,14 @@
+# GEAP jump-host inventory (project-f625f262-ce1a-467a-a2c / us-east4-a)
+# Hostnames here are what the agent should use instead of asking the user for IPs.
+
+[linux_jumphost]
+geap-linux-ansible-jumphost 10.200.22.10
+
+[linux_targets]
+geap-private-http ansible_host=10.200.21.2
+
+[windows_jumphost]
+geap-windows-ps-jumphost 10.200.22.11
+
+[windows_targets]
+geap-windows-target ansible_host=10.200.21.10

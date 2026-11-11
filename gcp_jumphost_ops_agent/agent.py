@@ -5,6 +5,7 @@ import logging
 import os
 import time
 import uuid
+from pathlib import Path
 from typing import Any, List, Optional
 
 import google.auth
@@ -99,6 +100,77 @@ def _gcp_agent_identity_headers(_readonly_context=None) -> dict[str, str]:
     return headers
 
 
+def _load_inventory() -> dict[str, Any]:
+    """Parse packaged inventory.txt into jump hosts and target hostnames/IPs."""
+    path = Path(__file__).with_name("inventory.txt")
+    inventory: dict[str, Any] = {
+        "path": str(path),
+        "groups": {},
+        "hosts": {},
+    }
+    if not path.is_file():
+        inventory["error"] = f"inventory.txt not found at {path}"
+        return inventory
+    current_group = "ungrouped"
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            current_group = line[1:-1].strip()
+            inventory["groups"].setdefault(current_group, [])
+            continue
+        parts = line.split()
+        name = parts[0]
+        ip = ""
+        for part in parts[1:]:
+            if part.startswith("ansible_host="):
+                ip = part.split("=", 1)[1]
+            elif not ip:
+                ip = part
+        host = {"name": name, "ip": ip, "group": current_group}
+        inventory["groups"].setdefault(current_group, []).append(host)
+        inventory["hosts"][name] = host
+        if ip:
+            inventory["hosts"][ip] = host
+    return inventory
+
+
+INVENTORY = _load_inventory()
+
+
+def _resolve_target(name_or_ip: str, *, prefer_ip: bool) -> str:
+    """Map inventory hostname to IP (Windows remoting) or keep Ansible inventory name."""
+    raw = (name_or_ip or "").strip()
+    if not raw:
+        return raw
+    host = INVENTORY.get("hosts", {}).get(raw)
+    if not host:
+        return raw
+    if prefer_ip:
+        return host.get("ip") or host.get("name") or raw
+    return host.get("name") or raw
+
+
+def _http_error_payload(exc: requests.HTTPError, *, context: dict[str, Any]) -> dict[str, Any]:
+    resp = exc.response
+    body = ""
+    if resp is not None:
+        try:
+            body = resp.text[:2000]
+        except Exception:
+            body = ""
+    return {
+        "status": "FAILED",
+        "error_type": "HTTPError",
+        "http_status": getattr(resp, "status_code", None),
+        "url": getattr(resp, "url", None),
+        "error": str(exc),
+        "response_body": body,
+        **context,
+    }
+
+
 def _dispatch_jumphost_metadata_command(
     *,
     project_id: str,
@@ -111,13 +183,25 @@ def _dispatch_jumphost_metadata_command(
     """Dispatches a command payload to a Jump Host VM via Compute Engine HTTPS API and polls Cloud Logging for stdout/stderr."""
     headers = _gcp_agent_identity_headers()
     headers["Content-Type"] = "application/json"
+    context = {
+        "project_id": project_id,
+        "zone": zone,
+        "jumphost_vm": jumphost_vm,
+        "run_id": command_payload.get("run_id"),
+        "command_payload": command_payload,
+    }
 
     inst_url = (
         f"https://compute.googleapis.com/compute/v1/projects/{project_id}"
         f"/zones/{zone}/instances/{jumphost_vm}"
     )
-    inst_resp = requests.get(inst_url, headers=headers, timeout=20)
-    inst_resp.raise_for_status()
+    try:
+        inst_resp = requests.get(inst_url, headers=headers, timeout=20)
+        inst_resp.raise_for_status()
+    except requests.HTTPError as exc:
+        return _http_error_payload(exc, context=context)
+    except Exception as exc:
+        return {"status": "FAILED", "error_type": type(exc).__name__, "error": str(exc), **context}
     inst_data = inst_resp.json()
     metadata = inst_data.get("metadata", {})
     fingerprint = metadata.get("fingerprint", "")
@@ -127,13 +211,43 @@ def _dispatch_jumphost_metadata_command(
     items.append({"key": metadata_key, "value": json.dumps(command_payload)})
 
     set_meta_url = f"{inst_url}/setMetadata"
-    set_resp = requests.post(
-        set_meta_url,
-        headers=headers,
-        json={"fingerprint": fingerprint, "items": items},
-        timeout=20,
-    )
-    set_resp.raise_for_status()
+    try:
+        set_resp = requests.post(
+            set_meta_url,
+            headers=headers,
+            json={"fingerprint": fingerprint, "items": items},
+            timeout=20,
+        )
+        set_resp.raise_for_status()
+        set_data = set_resp.json() if set_resp.content else {}
+        op_name = set_data.get("name")
+        if op_name:
+            op_url = (
+                f"https://compute.googleapis.com/compute/v1/projects/{project_id}"
+                f"/zones/{zone}/operations/{op_name}"
+            )
+            op_deadline = time.time() + 15
+            while time.time() < op_deadline:
+                time.sleep(1)
+                try:
+                    op_resp = requests.get(op_url, headers=headers, timeout=10)
+                    if op_resp.status_code == 200:
+                        op_data = op_resp.json()
+                        if op_data.get("status") == "DONE":
+                            if op_data.get("error"):
+                                return {
+                                    "status": "FAILED",
+                                    "error_type": "GCEOperationError",
+                                    "error": op_data.get("error"),
+                                    **context,
+                                }
+                            break
+                except Exception:
+                    pass
+    except requests.HTTPError as exc:
+        return _http_error_payload(exc, context=context)
+    except Exception as exc:
+        return {"status": "FAILED", "error_type": type(exc).__name__, "error": str(exc), **context}
 
     run_id = command_payload["run_id"]
     log_url = "https://logging.googleapis.com/v2/entries:list"
@@ -184,11 +298,26 @@ def _dispatch_jumphost_metadata_command(
 
 
 def list_jumphost_automation_catalog() -> dict[str, Any]:
-    """Lists the available Jump Host VMs, target VMs, pre-staged Ansible playbooks, and pre-staged PowerShell scripts."""
+    """Lists jump hosts, inventory.txt hostnames/IPs, example playbooks, and example PowerShell scripts."""
     return {
         "project_id": DEFAULT_TARGET_PROJECT,
         "zone": DEFAULT_TARGET_ZONE,
+        "inventory": INVENTORY,
         "catalog": PRE_STAGED_CATALOG,
+        "note": (
+            "Any playbook under /opt/ansible/playbooks on the Linux jump host and any .ps1 "
+            "under /opt/powershell/scripts (or C:\\automation\\scripts) on the Windows jump host can be executed. "
+            "Resolve target hostnames from inventory.txt; do not ask the user for an IP when the name is listed."
+        ),
+    }
+
+
+def list_jumphost_inventory() -> dict[str, Any]:
+    """Returns hostnames and IPs from packaged inventory.txt (Linux/Windows jump hosts and target VMs)."""
+    return {
+        "project_id": DEFAULT_TARGET_PROJECT,
+        "zone": DEFAULT_TARGET_ZONE,
+        "inventory": INVENTORY,
     }
 
 
@@ -199,20 +328,21 @@ def execute_ansible_playbook_from_jumphost(
     project_id: str = DEFAULT_TARGET_PROJECT,
     zone: str = DEFAULT_TARGET_ZONE,
 ) -> dict[str, Any]:
-    """Executes a pre-staged Ansible playbook from `/opt/ansible/playbooks/` on the Linux Ansible Jump Host (`geap-linux-ansible-jumphost`) against target Linux VMs (such as `geap-private-http`).
+    """Executes any Ansible playbook file present under `/opt/ansible/playbooks/` on the Linux Ansible Jump Host against inventory hostnames.
 
     Args:
-        playbook_name: Pre-staged playbook file name in `/opt/ansible/playbooks/` (e.g., `linux_health_check.yml`, `linux_service_status.yml`, `linux_disk_cleanup.yml`).
-        target_hosts: Target Linux host or inventory group in `/opt/ansible/inventory/hosts.ini` (default: `geap-private-http`).
+        playbook_name: Playbook file name on the jump host (any `.yml` in `/opt/ansible/playbooks/`, not limited to the sample catalog).
+        target_hosts: Hostname or group from inventory.txt / `/opt/ansible/inventory/hosts.ini` (default: `geap-private-http`).
         jumphost_vm: Name of the Ansible Jump Host VM (default: `geap-linux-ansible-jumphost`).
         project_id: GCP project ID where the jump host resides (default: `project-f625f262-ce1a-467a-a2c`).
         zone: GCP zone where the jump host resides (default: `us-east4-a`).
     """
+    resolved_hosts = _resolve_target(target_hosts, prefer_ip=False)
     run_id = f"ansible-{uuid.uuid4().hex[:10]}"
     payload = {
         "run_id": run_id,
         "playbook": playbook_name,
-        "target_hosts": target_hosts,
+        "target_hosts": resolved_hosts,
     }
     return _dispatch_jumphost_metadata_command(
         project_id=project_id,
@@ -226,27 +356,28 @@ def execute_ansible_playbook_from_jumphost(
 
 def execute_powershell_script_from_jumphost(
     script_name: str = "windows_health_check.ps1",
-    target_vm: str = "10.200.21.10",
+    target_vm: str = "geap-windows-target",
     script_args: str = "",
     jumphost_vm: str = DEFAULT_POWERSHELL_JUMPHOST,
     project_id: str = DEFAULT_TARGET_PROJECT,
     zone: str = DEFAULT_TARGET_ZONE,
 ) -> dict[str, Any]:
-    """Executes a pre-staged PowerShell (`.ps1`) script from the PowerShell Jump Host (`geap-windows-ps-jumphost`) against remote target VMs (`geap-windows-target` / `10.200.21.10`).
+    """Executes any PowerShell `.ps1` present on the PowerShell Jump Host against a target hostname from inventory.txt.
 
     Args:
-        script_name: Pre-staged PowerShell script name (e.g., `windows_health_check.ps1`, `windows_service_status.ps1`, `windows_temp_cleanup.ps1`).
-        target_vm: Remote target VM IP or hostname (default: `10.200.21.10` for `geap-windows-target`).
-        script_args: Optional extra arguments to pass to the PowerShell script (e.g., `-ServiceName ssh,cron`).
+        script_name: PowerShell script file name on the jump host (any `.ps1` in `/opt/powershell/scripts` or `C:\\automation\\scripts`, not limited to the sample catalog).
+        target_vm: Target hostname or IP from inventory.txt (hostname is resolved to IP). Default: `geap-windows-target`.
+        script_args: Optional extra arguments to pass to the PowerShell script (e.g., `-ServiceName wuauserv`).
         jumphost_vm: Name of the PowerShell Jump Host VM (default: `geap-windows-ps-jumphost`).
         project_id: GCP project ID where the jump host resides (default: `project-f625f262-ce1a-467a-a2c`).
         zone: GCP zone where the jump host resides (default: `us-east4-a`).
     """
+    resolved_target = _resolve_target(target_vm, prefer_ip=True)
     run_id = f"ps-{uuid.uuid4().hex[:10]}"
     payload = {
         "run_id": run_id,
         "script_name": script_name,
-        "target_vm": target_vm,
+        "target_vm": resolved_target,
         "script_args": script_args,
     }
     return _dispatch_jumphost_metadata_command(
@@ -325,26 +456,35 @@ root_agent = Agent(
     model=MODEL,
     name="gcp_jumphost_ops_agent",
     description=(
-        "Google Cloud Jump Host Automation Agent that executes pre-staged PowerShell scripts from "
-        "`geap-windows-ps-jumphost` and pre-staged Ansible playbooks from `geap-linux-ansible-jumphost` "
-        "against remote target VMs in `project-f625f262-ce1a-467a-a2c` (`us-east4-a`) without custom MCP servers."
+        "Google Cloud Jump Host Automation Agent that executes PowerShell scripts from "
+        "`geap-windows-ps-jumphost` and Ansible playbooks from `geap-linux-ansible-jumphost` "
+        "against inventory.txt target VMs in `project-f625f262-ce1a-467a-a2c` (`us-east4-a`)."
     ),
     instruction=(
         "You are the Google Cloud Jump Host Automation Specialist (`gcp_jumphost_ops_agent`).\n"
-        "You manage a 4-VM Jump Host architecture in project `project-f625f262-ce1a-467a-a2c` (zone `us-east4-a`):\n"
-        "1. Linux Ansible Jump Host: `geap-linux-ansible-jumphost` (`10.200.22.10`) -> runs `ansible-playbook` from `/opt/ansible/playbooks/` "
-        "against target Linux VM `geap-private-http` (`10.200.21.2`).\n"
-        "   - Pre-staged playbooks: `linux_health_check.yml`, `linux_service_status.yml`, `linux_disk_cleanup.yml`.\n"
-        "2. PowerShell Jump Host: `geap-windows-ps-jumphost` (`10.200.22.11`) -> runs PowerShell (`pwsh` / `.ps1`) scripts from `/opt/powershell/scripts/` "
-        "using `Invoke-Command` against target VM `geap-windows-target` (`10.200.21.10`).\n"
-        "   - Pre-staged scripts: `windows_health_check.ps1`, `windows_service_status.ps1`, `windows_temp_cleanup.ps1`.\n\n"
-        "WORKFLOW:\n"
-        "- Use `list_jumphost_automation_catalog` to inspect available jump hosts, target VMs, playbooks, and PowerShell scripts.\n"
-        "- Use `execute_ansible_playbook_from_jumphost` to run Ansible playbooks on `geap-linux-ansible-jumphost` targeting `geap-private-http`.\n"
-        "- Use `execute_powershell_script_from_jumphost` to run PowerShell `.ps1` scripts on `geap-windows-ps-jumphost` targeting `10.200.21.10` (`geap-windows-target`).\n"
-        "- Always report the exact `run_id`, `command`, `return_code`, and `stdout` returned from the jump host execution."
+        "Project `project-f625f262-ce1a-467a-a2c`, zone `us-east4-a`.\n"
+        "ALWAYS call `list_jumphost_inventory` (or catalog) first. Hostnames and IPs come from inventory.txt. "
+        "Never ask the user for an IP or hostname when it is already in inventory. "
+        "Never ask which sample script to use when the user already named a playbook or .ps1.\n"
+        "You MAY execute ANY playbook file on the Linux jump host (`/opt/ansible/playbooks/`) and ANY .ps1 "
+        "on the Windows jump host (`/opt/powershell/scripts` or `C:\\automation\\scripts`). "
+        "The sample catalog is examples only, not a whitelist.\n"
+        "Windows remoting: pass the inventory hostname (e.g. geap-windows-target); the tool resolves it to IP.\n"
+        "Linux Ansible: pass the inventory hostname (e.g. geap-private-http).\n"
+        "After every execute_* call, reply in the Playground with a clean, human-friendly summary for a non-technical reader, followed by an expandable or structured details section:\n"
+        "1. Executive Summary (in plain language):\n"
+        "   - Overall Status: Success / Failure\n"
+        "   - Target Machine & Jump Host used\n"
+        "   - Key Findings (e.g. Uptime, Disk space available/used percentage, Health condition, or Service states like 'wuauserv: stopped', 'LanmanWorkstation: stopped')\n"
+        "   - Top CPU Consumers formatted as a clean bulleted list or markdown table (Name, CPU%, Memory)\n"
+        "2. Actionable Takeaway / Recommendations (e.g., 'Disk usage is healthy at 26%, no action needed' or 'Service X is stopped')\n"
+        "3. Technical Execution Details (collapsible or clearly labeled at the bottom: run_id, return_code, duration_sec, command, raw stdout/stderr if needed for auditing)\n"
+        "- If status is FAILED: Clearly explain in plain language what went wrong, quoting the HTTP status and error.\n"
+        "- If status is DISPATCHED_PENDING_LOG: Explain that the command was successfully sent to the jump host and is currently executing, giving the run ID and Cloud Logging filter.\n"
+        "Do not dump raw unformatted JSON as the primary response."
     ),
     tools=[
+        list_jumphost_inventory,
         list_jumphost_automation_catalog,
         execute_ansible_playbook_from_jumphost,
         execute_powershell_script_from_jumphost,
