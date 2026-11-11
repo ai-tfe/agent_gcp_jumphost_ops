@@ -1,0 +1,46 @@
+name: Build and Push GEAP Jump Host Automation Agent Image
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      IMAGE: us-east4-docker.pkg.dev/svcprjprd/agent-images/gcp-jumphost-ops-agent:latest
+      EGRESS_GATEWAY: projects/svcprjgeap/locations/us-east4/agentGateways/egress-gateway
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: svcprjgeap
+          workload_identity_provider: projects/639577073118/locations/global/workloadIdentityPools/ai-tfe/providers/ai-tfe
+          service_account: ai-tfe@svcprjgeap.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure docker for Artifact Registry
+        run: gcloud auth configure-docker us-east4-docker.pkg.dev --quiet
+
+      - name: Fetch live egress gateway root CA
+        run: |
+          curl -sSf -H "Authorization: Bearer $(gcloud auth print-access-token)" \
+            "https://networkservices.googleapis.com/v1beta1/${EGRESS_GATEWAY}" \
+            | jq -er '.agentGatewayCard.rootCertificates | join("")' > agw-root.crt
+          openssl x509 -in agw-root.crt -noout -subject -startdate -fingerprint -sha256
+
+      - name: Build and push GEAP agent image
+        run: |
+          docker build -t "${IMAGE}" .
+          docker push "${IMAGE}"
+          DIGEST=$(docker image inspect "${IMAGE}" --format '{{index .RepoDigests 0}}')
+          echo "IMAGE_DIGEST=${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Built and pushed: ${DIGEST}"

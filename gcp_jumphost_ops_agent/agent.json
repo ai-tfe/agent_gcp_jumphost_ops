@@ -1,0 +1,74 @@
+{
+  "name": "GCP Jump Host Automation Agent",
+  "description": "Executes pre-staged PowerShell scripts from the PowerShell Jump Host (geap-windows-ps-jumphost) and pre-staged Ansible playbooks from the Linux Ansible Jump Host (geap-linux-ansible-jumphost) against remote target VMs without custom OS MCP servers.",
+  "version": "1.0.0",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false
+  },
+  "securitySchemes": {
+    "bearer": {
+      "httpAuthSecurityScheme": {
+        "scheme": "Bearer"
+      }
+    }
+  },
+  "securityRequirements": [
+    {
+      "schemes": {
+        "bearer": {
+          "list": []
+        }
+      }
+    }
+  ],
+  "defaultInputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "defaultOutputModes": [
+    "text/plain",
+    "application/json"
+  ],
+  "skills": [
+    {
+      "id": "ansible_jumphost_execution",
+      "name": "Ansible Playbook Execution via Linux Jump Host",
+      "description": "Runs pre-staged Ansible playbooks (linux_health_check.yml, linux_service_status.yml, linux_disk_cleanup.yml) from geap-linux-ansible-jumphost against target Linux VMs (geap-private-http).",
+      "tags": [
+        "gcp",
+        "ansible",
+        "playbook",
+        "jumphost",
+        "linux"
+      ],
+      "examples": [
+        "Run the linux_health_check.yml Ansible playbook from the Ansible jump host on geap-private-http",
+        "Execute linux_service_status.yml playbook against geap-private-http"
+      ]
+    },
+    {
+      "id": "powershell_jumphost_execution",
+      "name": "PowerShell Script Execution via PowerShell Jump Host",
+      "description": "Runs pre-staged PowerShell scripts (windows_health_check.ps1, windows_service_status.ps1, windows_temp_cleanup.ps1) from geap-windows-ps-jumphost against remote target VMs (geap-windows-target / 10.200.21.10).",
+      "tags": [
+        "gcp",
+        "powershell",
+        "ps1",
+        "jumphost",
+        "windows"
+      ],
+      "examples": [
+        "Run windows_health_check.ps1 from the PowerShell jump host against geap-windows-target (10.200.21.10)",
+        "Execute windows_temp_cleanup.ps1 on the remote target VM via the PowerShell jump host"
+      ]
+    }
+  ],
+  "supportedInterfaces": [
+    {
+      "url": "https://localhost:8080",
+      "protocolBinding": "JSONRPC",
+      "protocolVersion": "1.0"
+    }
+  ]
+}

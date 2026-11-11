@@ -1,0 +1,6 @@
+fastapi>=0.133,<1
+uvicorn>=0.30.0
+google-adk[otel-gcp,mcp,a2a]==2.10.0
+google-cloud-aiplatform[agent_engines,adk]>=1.112,<2
+google-auth>=2.30.0
+requests>=2.31.0
